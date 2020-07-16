@@ -1,0 +1,1165 @@
+---
+title: "Warenkorbanalyse Gruppe B"
+author: "Vincenzo Timmel, Eric Winter"
+date: "9. März 2020"
+output:
+  html_notebook: default
+  html_document:
+    df_print: paged
+    code_folding: hide
+  pdf_document: default
+---
+
+```{r}
+library(plotly)
+library(plyr)
+library(tidyr)
+library(dplyr)
+library(tidyverse)
+library(RColorBrewer)
+library(arules)
+require(scales)
+require(gridExtra)
+library(arulesViz)
+library(RPostgreSQL)
+library(progress)
+library(igraph)
+```
+
+```{r}
+# define the database connection string
+DB_HOST = 'server2053.cs.technik.fhnw.ch' # or 86.119.36.94 depending on the network
+DB_PORT = 5432
+DB_DBNAME = 'warenkorb_db'
+DB_USERNAME = 'db_user' 
+DB_PASSWORD = 'db_user_pw' 
+```
+
+```{r}
+# load the PostgreSQL driver
+drv <- dbDriver("PostgreSQL")
+# connect to the database
+con <- dbConnect(drv,
+                 dbname = DB_DBNAME,
+                 host = DB_HOST, port = DB_PORT,
+                 user = DB_USERNAME, password = DB_PASSWORD)
+```
+
+```{r}
+aisle_db <- tbl(con, "aisle")
+department_db <- tbl(con, "department")
+orders_db <- tbl(con, "orders")
+orders_product_prior_db <- tbl(con, "orders_product_prior")
+orders_product_train_db <- tbl(con, "orders_product_train")
+product_db <- tbl(con, "product")
+```
+# Projektauftrag
+Wir wurden von Ihnen beauftragt, folgende drei Fragen Mithilfe dieser Daten zu beantworten:
++ Stärkung und Promotion der Bio-Sparte
++ eine kunden-freundliche Anordnung der Produkte, so dass Kunden Artikel leichter finden und beim Einkauf schneller zum Ziel kommen (store layout design)
++ eine Analyse der Ladenöffnungszeiten und Prüfung der Einsatzpläne der Mitarbeiter, welche den Bedürfnissen der Kundschaft und der Angestellten Rechnung trägt
+
+# Repräsentativität der Daten
+Die Daten sind sehr sauber gehalten und ermöglichen so eine einfache Auswertung. Diese Daten zeigen über einen langen Zeitraum alle Einkäufe, inkl. Zeit und Wochentag des Einkaufes, welche Produkte gekauft wurden, zu welchem Department und Aisle diese gehören und in welcher Reihenfolge diese in den Warenkorb gelegt wurden. Die Daten enthalten also eine grosse Dichte an Informationen und erlauben uns, spezifische, aber auch allgemeingültige Entscheidungen zu treffen.
+
+(Eigentlich gehören diese Daten Instacart, einem Verkaufsservice, welcher einem erlaubt, Leute zu buchen, die für einen den Einkauf erledigen. D.h. diese Daten sind nicht aus einer realen Detailhandel-Verkaufsstelle gesammelt. Diese sind also streng genommen nicht repesentativ, aber für dieses Projekt sollte man das ja nicht betrachten).
+
+# Promotion Bioprodukte
+Wie viele Bioprodukte sind im Angebot und wie viele werden tatsächlich verkauft? Gibt es überhaupt Nachfrage für Bioprodukte?
+```{r}
+if(!file.exists("products_offered_sql.rds")){
+  products_offered_sql <- dbGetQuery(con, "SELECT p.product_name, p.product_id, a.aisle, d.department,
+            (CASE WHEN lower(p.product_name) LIKE '%organic%' OR
+                  lower(p.product_name) LIKE '%organic %' OR
+                  lower(p.product_name) LIKE '% organic%' OR
+                  lower(p.product_name) LIKE '%bio %' OR
+                  lower(p.product_name) LIKE '% bio%' THEN 1
+                  ELSE 0 END) AS organic
+  FROM product p
+  JOIN (SELECT * 
+        FROM aisle) AS a
+        ON a.aisle_id = p.aisle_id
+  JOIN (SELECT * 
+        FROM department) AS d
+        ON d.department_id = p.department_id")
+  saveRDS(products_offered_sql, "products_offered_sql.rds")
+}else{
+  products_offered_sql <- readRDS("products_offered_sql.rds")
+}
+```
+
+```{r}
+if(!file.exists("products_bought_sql.rds")){
+  products_bought_sql <- dbGetQuery(con, "SELECT p.product_name, p.product_id, aisle, department,
+          (CASE WHEN lower(p.product_name) LIKE '%organic%' OR
+                lower(p.product_name) LIKE '%organic %' OR
+                lower(p.product_name) LIKE '% organic%' OR
+                lower(p.product_name) LIKE '%bio %' OR
+                lower(p.product_name) LIKE '% bio%' THEN 1
+                ELSE 0 END) AS organic
+FROM product p
+JOIN (SELECT * 
+      FROM orders_product_prior opp
+      UNION ALL 
+      SELECT *
+      FROM orders_product_train opt) AS op
+      ON p.product_id = op.product_id
+JOIN (SELECT * 
+      FROM aisle) AS a
+      ON a.aisle_id = p.aisle_id
+JOIN (SELECT * 
+      FROM department) AS d
+      ON d.department_id = p.department_id
+JOIN (SELECT orders_id, user_id
+      FROM orders) AS o
+      ON o.orders_id = op.orders_id")
+  saveRDS(products_bought_sql, "products_bought_sql.rds")
+}else{
+  products_bought_sql <- readRDS("products_bought_sql.rds")
+}
+```
+
+```{r}
+# Labs subtitles, runden, %, n = .. (subtitle), Leute mögen keine Mathematik.
+
+p1 <- ggplot(data = products_offered_sql, aes(x = factor(organic), fill = factor(organic))) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat='count', aes(label = paste(format(round_any(..count.., accuracy = 1e3, f = round), scientific=F, big.mark   = "'"), '\n', '(', round(..count../sum(..count..) * 100, digits = 2), '%', ')')), position=position_stack(vjust = 0.5)) + 
+  scale_x_discrete(name ='', labels=c('0' = 'kein Bio', '1' = 'Bio')) +
+  scale_fill_manual(values = c("0" = "grey48", "1" = "springgreen4")) +
+  scale_y_continuous(labels = unit_format(unit = "k", scale = 1e-3)) +
+  ylab('Anzahl Produkte') +
+  ggtitle('Produkte im Angebot')
+
+
+p2 <- ggplot(data = products_bought_sql, aes(x = factor(organic), fill = factor(organic))) +
+  geom_bar(show.legend = FALSE) +
+  #geom_text(stat='count', aes(label=format(..count.., big.mark="'")), position=position_stack(vjust = 0.5)) + 
+  geom_text(stat='count', aes(label= paste(format(round_any(..count.., accuracy = 1e6, f = round), scientific=F, big.mark   = "'"), '\n', '(', round(..count../sum(..count..) * 100, digits = 2), '%', ')')), position=position_stack(vjust = 0.5)) +
+  scale_x_discrete(name ='', breaks = c('0', '1'), labels=c('kein Bio', 'Bio')) +
+  scale_fill_manual(values = c("0" = "grey48", "1" = "springgreen4")) +
+  scale_y_continuous(labels = unit_format(accuracy = 1, unit = "M", scale = 1e-6)) + 
+  ylab('Anzahl Produkte') + 
+  ggtitle("Produkte verkauft")
+
+grid.arrange(p1, p2, ncol=2)
+```
+Wenn man die beiden Diagramme mit einander vergleicht, sieht man, dass anteilig mehr Bioprodukte gekauft werden, als sie im Angebot vorhanden sind.
+
+Konkret heisst das:
+
+- Angeboten werden von den insgesamt `r format(nrow(products_offered_sql), nsmall=1, big.mark="'")` Produkten `r format(nrow(subset(products_offered_sql, organic == 1)), nsmall=1, big.mark="'")` Bioprodukte (etwa `r round(nrow(subset(products_offered_sql, organic == 1)) / nrow(products_offered_sql) * 100, digits = 0)`%)
+
+- Gekauft werden aber von `r format(nrow(products_bought_sql), nsmall=1, big.mark="'")` verschiedenen Produkten `r format(nrow(subset(products_bought_sql, organic== 1)), nsmall=1, big.mark="'")` Bioprodukte (etwa `r round(nrow(subset(products_bought_sql, organic == 1)) / nrow(products_bought_sql) * 100, digits = 0)` %)
+
+
+### Wie sieht der Anteil der Bioprodukte auf Warenkorbebene aus?
+
+```{r echo=FALSE, warning=FALSE}
+if(!file.exists("user_bought.rds")){
+  user_bought <- dbGetQuery(con, "SELECT o.user_id, o.orders_id, COUNT(o.orders_id) as count_orders,
+          SUM((CASE WHEN lower(p.product_name) LIKE '%organic%' OR
+                lower(p.product_name) LIKE '%organic %' OR
+                lower(p.product_name) LIKE '% organic%' OR
+                lower(p.product_name) LIKE '%bio %' OR
+                lower(p.product_name) LIKE '% bio%' THEN 1
+                ELSE 0 END)) AS sum_organic
+FROM product p
+JOIN (SELECT * 
+      FROM orders_product_prior opp
+      UNION ALL 
+      SELECT *
+      FROM orders_product_train opt) AS op
+      ON p.product_id = op.product_id
+JOIN (SELECT * 
+      FROM aisle) AS a
+      ON a.aisle_id = p.aisle_id
+JOIN (SELECT * 
+      FROM department) AS d
+      ON d.department_id = p.department_id
+JOIN (SELECT orders_id, user_id
+      FROM orders) AS o
+      ON o.orders_id = op.orders_id
+GROUP BY o.user_id, o.orders_id")
+  saveRDS(user_bought, "user_bought.rds")
+}else{
+  user_bought <- readRDS("user_bought.rds")
+}
+```
+
+
+```{r create_user_ratio, echo=FALSE, warning=FALSE}
+# create column ratio_organic
+user_bought_ratio <- user_bought %>%
+  dplyr::mutate(ratio = round(sum_organic / count_orders, digits = 2))
+head(user_bought_ratio)
+```
+
+```{r}
+org_ratio_user <- user_bought_ratio %>%
+  dplyr::group_by(user_id) %>%
+  dplyr::summarise(ratio = round(mean(ratio), digits = 2))
+```
+
+```{r count_orders_vs_ratio, echo = FALSE}
+ggplot(data = user_bought_ratio) +
+  geom_point(mapping = aes(x = count_orders, y = ratio * 100), alpha = 0.1, color = "springgreen4") +
+  ggtitle("Anteil Bioprodukte pro Warenkorb") +
+  xlab("Produkte pro Warenkorb") + ylab("Bioprodukte in %")
+```
+
+Erkennbar ist, dass es durchaus einige Kunden gibt, die gar keine oder ausschliesslich nur Bioprodukte kaufen. Ein weiterer interessanter Punkt ist, dass sich geometrische Muster im Plot bilden. Der Grund hierfür ist, dass es pro Anzahl Produkte im Warenkorb nicht beliebig viele verschiedene Verhältnisse zwischen Bio- und nicht Bioprodukten gibt. 
+
+Bei 5 Produkten im Warenkorb gibt es folgende möglichen Kombinationen:
+
+- keine Bioprodukte und 5 nicht Bioprodukte: 0% Bio
+- 1 Bioprodukt und 4 nicht Bioprodukte: 20% Bio 
+- 2 Bioprodukte und 3 nicht Bioprodukte: 40% Bio
+- 3 Bioprodukte und 2 nicht Bioprodukte: 60% Bio
+- 4 Bioprodukte und 1 nicht Bioprodukt: 80% Bio
+- 5 Bioprodukte und keine nicht Bioprodukte: 100% Bio
+
+Somit gibt es an diesen Punkten eine Überlagerung von mehreren Datenpunkten an diesen Stellen und dadurch bilden sich solche Muster.
+
+Je mehr Produkte im Warenkorb liegen, umso mehr Möglichkeiten gibt es.
+
+### Bioprodukte auf Ebene Kunde
+```{r echo = FALSE}
+plot_ly(x = org_ratio_user$ratio * 100, type = 'histogram') %>%
+  layout(title='Prozentualer Anteil Bioprodukte pro Warenkorb')
+```
+In diesem Plot ist deutlich zu erkennen, dass die viele Kunden unter 50% Anteil Bioprodukte kaufen. Die meisten kaufen sogar gar keine Bioprodukte. Das "Sägezahnmuster" existiert aus den gleichen Gründen zustande wie das Muster in der Grafik "Anteil Bioprodukte pro Warenkorb".
+
+Betrachten wir zusätzlich eine kurze statistsche Zusammenfassung der Daten:
+
+Betrachten wir deshalb eine kurze statistsche Zusammenfassung der Daten:
+```{r}
+summary(org_ratio_user$ratio*100)
+```
+
+Hier wird die obige Vermutung bestätigt: Die 75% der Kunden hat in ihren Einkäufen unter 50% Bioprodukte im Warenkorb. Druchschnittlich sind es etwa 27% Bioprodukte pro Warenkorb. Der Maximalwert zeigt uns jedoch, dass es auch Warenkörbe gibt, die ausschliesslich aus Bioprodukten bestehen.
+
+### Schwankungen beim Kauf von Bioprodukten
+Wie stark schwankt der Anteil Bioprodukte bei Kunden?
+
+```{r user_ratio_min_max}
+user_min_max <- user_bought_ratio %>%
+  group_by(user_id) %>%
+  dplyr::summarise(delta = round(max(ratio) - min(ratio), digits = 1), over_50 = ifelse(max(ratio) > 0.5, "Ja", "Nein")) %>%
+  arrange(desc(delta))
+```
+
+Auf der X-Achse ist die Differenz des maximalen und minimalen prozentualen Anteils der Kunden zusehen. Die Werte sind auf die nächsten 10% gerundet.
+
+Beispiel: Eine Kundin kauft mit folgenden Anteilen Bioprodukte ein:
+
+- 54%
+- 35%
+- 78%
+- 61%
+
+Die Differenz des minimalen und maximalen Wertes sind 78% - 35% = 43%. Dieses Ergebnis wird auf 40% abgerundet. 
+
+Betrachten wir diese Differenz für jeden Kunden, gibt sie uns Auskunft darüber, wie stark das Einkaufsverhalten der Kunden schwankt. Kunden die sowieso schon Bioprodukte kaufen, müssen nicht mehr in Promotionsaktionen mit eingschlossen werden und man kann dort Kosten sparen. Auf der anderen Seite sind leute die eine höhe Differenz des Bioanteils bei ihren Einkäufen zeigen, sher gute Ziele für Promotionsaktionen.
+
+```{r echo=FALSE}
+ggplot(data = user_min_max) +
+  geom_bar(mapping = aes(x = delta * 100), fill = "springgreen4") +
+  ggtitle("Differenz gekaufter Bioprodukte") +
+  xlab("Differenz in %") + ylab("Anzahl Kunden") +
+  scale_x_continuous(breaks = c(0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100))
+```
+
+## Bioanteil einzelner Kunden betrachten (Microtargeting)
+Betrachtet man das Einkaufsverhalten eines einzelnen Kunden im Bezug auf gekaufte Bioprodukte, können die bereits vermuteten Schankungen isoliert werden
+
+```{r example_user, echo=FALSE}
+# filter for one user id
+user_example <- user_bought_ratio %>%
+  select(user_id, ratio) %>%
+  filter(user_id == 206209) %>%
+  rowid_to_column("index")
+
+# Plot it
+ggplot(data = user_example) +
+  geom_point(mapping = aes(x = index, y = ratio * 100),color = "springgreen4") +
+  geom_line(mapping = aes(x = index, y = ratio * 100),color = "springgreen4") +
+  ggtitle("Entwicklung des Anteils %-Bioprodukte eines spezifischen Kunden") +
+  xlab("Warenkörbe") + ylab("Bioprodukte in %")
+```
+Da dieser Kunde immer einen schwankenden Anteil Bioprodukte kauft, wäre er gut geeignet als Ziel für Promotionsaktionen, da er bereit ist Bioprodukte zu kaufen, das aber nur unter gewissen Umständen. Wenn solche Kunden einen Grund haben, können sie dauerhafte "Biokunden" werden. Beispielsweise durch gezielt zugestellte Gutscheine, Aufklärungskampagnen oder Ähnliches.
+
+## Assoziationanalyse
+```{r}
+products_orders_id <- orders_product_prior_db %>%
+  union_all(orders_product_train_db) %>%
+  left_join(product_db) %>%
+  left_join(orders_db) %>%
+  left_join(aisle_db) %>%
+  select(c(orders_id, product_name)) %>%
+  distinct()
+```
+
+```{r}
+products_orders_id_grouped <- products_orders_id %>%
+  group_by(orders_id)
+product_orders_concat <- dplyr::summarise(products_orders_id_grouped,
+                                 products_per_order = str_flatten(product_name, collapse=";")) %>%
+  select(products_per_order)
+```
+
+```{r}
+destfile="transaction_data_products.csv"
+  if(!file.exists(destfile))
+  write.csv(product_orders_concat, file = "transaction_data_products.csv", quote = FALSE, row.names = FALSE)
+```
+
+```{r, warning = FALSE}
+if(!exists("tr"))
+  tr <- read.transactions('transaction_data_products.csv', format = 'basket', sep=';', quote = "")
+```
+
+Mit Hilfe einer Assoziationanalyse kann man herausfinden, welche Produkte in Kombination mit einander gekauft werden. So kann man Kunden, die 3 von 4 gängigen Produkten kaufen, das vierte empfehlen und die Wahrscheinlichkeit, dass es tatsächlich gekauft wird ist hoch.
+
+Auch kann man sehen, welche Produkte wie häufig gekauft werden. Im folgenden Plot sieht man beispielsweise, dass Früchte sehr häufig gekauft werden. Auf der Y-Achse kann man den prozentualen Anteil der Häufigkeit ablesen.
+
+```{r, echo = FALSE}
+itemFrequencyPlot(tr,topN=30,type="relative",col=brewer.pal(8,'Accent'), main="Meistverkaufte Produkte, relativ")
+```
+
+```{r}
+# Uns interessieren ja mehr Bioprodukte zu verkaufen, also behalten wir nur Regeln, welche zu Bioprodukten führen.
+# https://stackoverflow.com/questions/27926131/how-to-get-items-for-both-lhs-and-rhs-for-only-specific-columns-in-arules
+rules_2_bio <- apriori(tr, parameter = list(supp=0.001, conf=0.3,maxlen=20000, target = "rules",minlen=2))
+G_rules_2_bio<-sort(rules_2_bio,by="confidence",decreasing = TRUE)
+G_rules_2_bio_filtered <- subset(G_rules_2_bio, subset = rhs %pin% "organic" | rhs %pin% " Bio" | rhs %pin% "Bio " | rhs %pin% "Organic")
+```
+## Cross-Selling für organische Produkte
+Cross-Selling beschreibt das zusätzliche Verkaufen von Dienstleistungen oder Produkten. Ein Vorgehen, um Crossselling zu erfolgreich umzusetzen, ist der Apriori-Algorithmus. Dieser Algorithmus analysiert Warenkörbe und zeigt auf, welche Produkte oft zusammen gekauft werden genannt Regel, und wie oft diese Regel vorkommt. Diese Angabe wird vom Algorithmus zurückgegeben als "Support", "Confidence" und "Lift".
+Der Support zeigt uns die relative Häufigkeit dieser Regel, also wie oft diese Produkte zusammen in einem Warenkorb laden, geteilt durch die Anzahl von allen Warenkörbe. 
+Der Confidence ist wie oft zwei Produkte zusammengekauft werden, geteilt durch das Produkt, auf dem die Regel basieren soll. Der Lift sagt an, wie stark diese Regel von der Norm abweicht und ob diese Produkte positiv, negativ oder gar nicht miteinander korrelieren. 
+Der Lift entsteht, wenn man den Support durch das Vorkommen von beiden Produkten teilt.
+
+Lesebeispiel für den tiefroten Punkt: Wenn man {Organic Yellow Squash} kauft, kauft man mit 44.6% Wahrscheinlichkeit auch {Organic Zucchini}. Falls also ein Kunde nur {Organic Yellow Squash} kauft, kann man diesem Kunden einen persönliche Gutschein für {Organic Zucchini} zustellen oder im Allgemeinen diese nahe beieinander positionieren. Der Support sagt uns, dass diese Produkte in 0.0000155% der Warenkörbe zusammen vorkommen und der Lift, dass diese Regel stark von der Norm abweicht und diese Produkte deshalb start zusammen korrelieren. 
+```{r, echo = FALSE}
+color_list = list(color = 'white')
+plot(G_rules_2_bio_filtered, engine = 'plotly')
+```
+```{r}
+all_useful_data_joined_db <- orders_product_train_db %>%
+  union_all(orders_product_prior_db) %>% 
+  left_join(orders_db) %>%
+  left_join(product_db)
+```
+
+```{r}
+# Das ersetzt die Tagesnummer mit dem Tagesnamen. Es wurde angenommen, dass Tag 0 der Samstag ist.
+wochentag_nummer <- tibble(Wochentag = c('Samstag', 'Sonntag', 'Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag'), order_dow = 0:6)
+add_factor <- function(df)
+  factor(df$Wochentag, levels = c('Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag','Samstag', 'Sonntag'))
+```
+
+```{r}
+if(!file.exists("cart_sizes.rds")){
+  cart_sizes <- dbGetQuery(con, "SELECT orders_id, MAX(op.add_to_cart_order) AS size_carts FROM
+(SELECT product_id, add_to_cart_order, orders_product_train.orders_id
+  FROM orders_product_train 
+  UNION ALL
+  SELECT product_id, add_to_cart_order, orders_product_prior.orders_id
+  FROM orders_product_prior
+  ) AS op
+GROUP BY op.orders_id")
+  saveRDS(cart_sizes, "cart_sizes.rds")
+}else{
+  cart_sizes <- readRDS("cart_sizes.rds")
+}
+```
+
+# Layout
+## Statistik über Anzahl Produkte in den Warenkörben
+```{r, warning = FALSE, echo = FALSE}
+summary((cart_sizes)$size_carts)
+```
+## Bestehendes Layout
+Hier sehen wir das ursprüngliche Layout. 
+Es unterscheidet sich von dem Layout, das wir erhalten haben. Um das bestehende Layout zu finden, kreierten wir eine Liste mit allen Deparments. Je früher und je häufiger ein Artikel aus einem Deparment (via add_to_cart_order) in den Warenkorb gelegt wird, desto früher taucht dieses in der Liste auf. "Dairy eggs" ist beispielsweise sehr oft als zweites in den Warenkörben gelandet und nicht erst gegen Ende wie man es im usprünglichen Layout erwarten würde. Beiliegend zu diesem Skript findet man ein auf dieser Liste basierendes PDF mit diesem generierten Layout. 
+```{r}
+  if(!file.exists("communicated_layout.rds")){
+        communicated_layout1 <- orders_product_prior_db %>%
+            union_all(orders_product_train_db) %>%
+            left_join(product_db) %>%
+            left_join(orders_db) %>%
+            left_join(department_db) %>%
+            select(orders_id, department, add_to_cart_order) %>%
+            group_by(orders_id, department) %>%
+            dplyr::summarise(min_add = min(add_to_cart_order), products_bought = n()) %>%
+            arrange(orders_id, min_add)
+    
+        communicated_layout1 <- collect(communicated_layout1)
+# Wir brauchen diese eher "hässliche" Form des Codes da der Code oben folgendes Datenset generiert:
+        
+
+# +------------+------------+-------------------+----------------+
+# | order_id   | Department | Add_to_cart_order | product_bought |
+# +------------+------------+-------------------+----------------+
+# |           1|     produce|                  1|             112|
+# +------------+------------+-------------------+----------------+
+# |           1|      snacks|                  5|             312|
+# +------------+------------+-------------------+----------------+
+# |           1|        deli|                  6|            3132|
+# +------------+------------+-------------------+----------------+
+# |           2|     produce|                  1|             112|
+# +------------+------------+-------------------+----------------+
+# |           2|      snacks|                  5|            3122|
+# +------------+------------+-------------------+----------------+
+# |           2|        deli|                  6|           32131|
+# +------------+------------+-------------------+----------------+
+        
+# Dies ist so, da Kunden natürlich mehrere Produkte aus dem selben Deparment in den Warenkorb legen können. Da nicht jeder Kunde die gleiche Anzahl Früchte kauft, müssen wir das irgendwie normalisieren. Dies machen wir dadurch, dass, wenn jemand mehre Früchte in den Warenkorb legt, wir nur das minimum von "add_to_cart_order" von diesen Früchten nehmen. Wenn also als erstes 3 Früchte in den Warenkorb laden, normalisieren wir "add_to_cart_order" zu 1 und zählen das als 3x Früchte wurden als erstes in den Warenkorb gelegt von diesem Kunden, also "products_bought" = 3. Wenn dieser Kunde danach 4x Snacks kauft, fängt die "add_to_cart_order" von den snacks bei 4 an und geht bis 8. Dies normalisieren wir zu "add_to_cart_order" 2 und "products_bought" 4. Da wir immer das minimum nehmen, nennen wir es zu "min_add" um. 
+        
+# Der hässliche code hier mit dplyr::mutate und lag kommt genau 22 mal vor, da es 21 Deparments gibt (warum das +1 kommt weiter unten). Die Reihenfolge der Artikel nach 21 interessiert uns deshalb nicht. Was dieser Code-block macht, ist, dass er sich anschaut, ob "min_add" eine Reihe unten um mehr als 1 grösser ist. Ebenfalls werden "NAs" mit 1 ersetzt, da bei der ersten Zeile natürlich kein Lag möglich ist. Ifelse funktioniert Zeileweise, also kann es Zeilen geben, wo das zutrifft und Zeilen, wo das nicht zutrifft. 
+
+
+# +------------+------------+-------------------+----------------+
+# | order_id   | Department | Add_to_cart_order | product_bought |
+# +------------+------------+-------------------+----------------+
+# |           1|     produce|                  1|             112|
+# +------------+------------+-------------------+----------------+
+# |           1|      snacks|                  4|             312|
+# +------------+------------+-------------------+----------------+
+# |           1|        deli|                  6|            3132|
+# +------------+------------+-------------------+----------------+
+# |           2|     produce|                  1|             112|
+# +------------+------------+-------------------+----------------+
+# |           2|      snacks|                  5|            3122|
+# +------------+------------+-------------------+----------------+
+# |           2|        deli|                  7|           32131|
+# +------------+------------+-------------------+----------------+
+        
+# Hier wäre das also Zeilenweise "False, True, True, False, True, True" und bei "min_add" würde bei True 1 substrahiert werden. Falls dies nicht der Fall wäre, bleibt "min_add" gleich. Somit sieht das danach so aus:
+        
+
+# +------------+------------+-------------------+----------------+
+# | order_id   | Department | Add_to_cart_order | product_bought |
+# +------------+------------+-------------------+----------------+
+# |           1|     produce|                  1|             112|
+# +------------+------------+-------------------+----------------+
+# |           1|      snacks|                  3|             312|
+# +------------+------------+-------------------+----------------+
+# |           1|        deli|                  5|            3132|
+# +------------+------------+-------------------+----------------+
+# |           2|     produce|                  1|             112|
+# +------------+------------+-------------------+----------------+
+# |           2|      snacks|                  4|            3122|
+# +------------+------------+-------------------+----------------+
+# |           2|        deli|                  6|           32131|
+# +------------+------------+-------------------+----------------+
+        
+# Dies passiert nun 22 mal. Die eine mehr kommt daher, da es Fälle gibt, wo ein Kunde aus einem Department nur einen Artikel genommen hat. Somit reicht das +1 bei Lag nicht. Erklärung: 
+
+# +------------+------------+-------------------+----------------+
+# | order_id   | Department | Add_to_cart_order | product_bought |
+# +------------+------------+-------------------+----------------+
+# |           1|     produce|                  1|             112|
+# +------------+------------+-------------------+----------------+
+# |           1|      snacks|                  4|             312|
+# +------------+------------+-------------------+----------------+
+# |           1|        deli|                  5|            3132|
+# +------------+------------+-------------------+----------------+
+
+# Somit ist es "False, True, False", somit "laggt" die Zeile zwei nun wirklich hinterher: 
+        
+# +------------+------------+-------------------+----------------+
+# | order_id   | Department | Add_to_cart_order | product_bought |
+# +------------+------------+-------------------+----------------+
+# |           1|     produce|                  1|             112|
+# +------------+------------+-------------------+----------------+
+# |           1|      snacks|                  3|             312|
+# +------------+------------+-------------------+----------------+
+# |           1|        deli|                  5|            3132|
+# +------------+------------+-------------------+----------------+
+
+# Darum 22 und nicht 21. Das gibt uns auch noch nicht das vollständige existierende Layout, dieser kommt im nächsten Block.
+        
+        communicated_layout <- communicated_layout1 %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          dplyr::mutate(min_add = ifelse(min_add > lag(min_add,1,1)+1, min_add-1, min_add)) %>%
+          group_by(min_add, department) %>%
+          summarize(products_bought_sum = sum(products_bought)) %>%
+          arrange(min_add, desc(products_bought_sum))
+  }else{
+    communicated_layout = readRDS("communicated_layout.rds")
+  }
+```
+
+```{r}
+# Zuerst filtern wir alle "min_add" kleiner als 21, da die Reihenfolge von mehr als 21 Departments, wenn wir nur 21 Departments haben, keinen Sinn macht. 
+# Dann generieren wir ein leeres Array names "store_layout". Solange "data" noch Zeilen hat, funktioniert diese Loop. In dieser Loop filtern im ersten Schritt alle Zeilen, welche "add_min" == 1 haben. Nun nehmen wir das Maximum von "products_bought_sum" und schauen uns an, welches Department das ist. Dieses kommt dann in "store_layout" rein. Dann droppen wir im ursprünglichen dieses gefundene Department, da es schon im "store_layout" vorkommt. 
+
+# Nun schauen wir uns an, was als zweites in den warenkorb gelegt wurden, nehmen uns da das maximum und appenden das in "store_layout" und droppen das "department", da es nun schon vorkommt. Dies geht so weiter, bis alle Departments fallen gelassen wurden und somit die Loop beendet wird.
+if(!exists("store_layout")){
+  data <- communicated_layout %>%
+    filter(min_add <=21) %>%
+    select(department, min_add, products_bought_sum)
+  i = 1
+  store_layout <- c()
+  while(nrow(data)){
+    temp <- data %>%
+      filter(min_add == i) %>%
+      filter(products_bought_sum == max(products_bought_sum))
+    store_layout <- c(store_layout, temp[,1])
+    data <- data[!grepl(temp[,1], data$department),]
+    i = i + 1
+    print(temp)
+  }
+}
+```
+
+```{r}
+store_layout[1:21]
+```
+## Optimiertes Layout
+Im Plot sind die Departments nach Verkaufszahlen angeordnet. Da es viele diverse Warenkörbe gibt, setzt sich das optimale Layout anhand der Verkaufszahlen der einzelnen Departments zusammen. Deparments mit hohen Verkaufszahlen befinden sich eher am Anfang. Ebenfalls hat es ein Department für Aisles, welche in kleinen Warenkörben vorkommen (Folgt gleich nach dieser Information). Beiliegend zu diesem Skript findet man ein auf dieser Liste basierendes PDF, welches das optimierte Layout anzeigt. 
+```{r}
+if(!file.exists("products_bought_per_department.rds")){
+  products_bought_per_department <- dbGetQuery(con, "SELECT department, count(op1.product_id) AS Number_of_products_per_deparment
+FROM product
+LEFT JOIN
+  (SELECT orders_id, product_id
+  FROM orders_product_train
+  UNION ALL
+  SELECT orders_id, product_id
+  FROM orders_product_prior
+    ) AS op1
+ON op1.product_id = product.product_id
+LEFT JOIN
+(SELECT * FROM department) as op2
+on product.department_id = op2.department_id
+GROUP BY op2.department
+ORDER BY Number_of_products_per_deparment DESC")
+  saveRDS(products_bought_per_department, "products_bought_per_department.rds")
+}else{
+  products_bought_per_department <- readRDS("products_bought_per_department.rds")
+}
+```
+
+
+```{r}
+products_bought_per_department$department <- factor(products_bought_per_department$department, levels = unique(products_bought_per_department$department)[order(products_bought_per_department$number_of_products_per_deparment, decreasing = TRUE)])
+p <- plot_ly(y = products_bought_per_department$number_of_products_per_deparment, x = products_bought_per_department$department, type = "bar") %>%
+  layout(title='Von welchen Departments wird am meisten bestellt?')
+```
+
+```{r echo=FALSE}
+p
+```
+
+## Welche Aisles kommen häufig in kleinen Warenkörben vor?
+Betrachtet man nur Warenkörbe mit weniger als vier Produkten, kann man zusätzliche Optimierungen im Layout vornehmen. Die Aisles, die oft in diesen Warenkörben vorkommen, sollte man nahe am Eingang / Ausgang stellen, um Leuten einen schnellen und kleinen Einkauf zu ermöglichen. 
+
+```{r}
+if(!file.exists("quick_visit_aisles_4.rds")){
+  quick_visit_aisles_4 <- dbGetQuery(con, "SELECT aisle, COUNT(a.aisle) AS aisle_total_number
+FROM product 
+JOIN
+  (SELECT product_id, add_to_cart_order, orders_product_train.orders_id
+  FROM orders_product_train 
+  WHERE add_to_cart_order <= 4
+  UNION ALL
+  SELECT product_id, add_to_cart_order, orders_product_prior.orders_id
+  FROM orders_product_prior
+  WHERE add_to_cart_order <= 4
+  ) AS op
+  ON product.product_id = op.product_id
+JOIN 
+  (SELECT * FROM aisle) AS a
+  ON product.aisle_id = a.aisle_id
+JOIN 
+  (SELECT * FROM department) AS d
+  ON d.department_id = product.department_id
+LEFT JOIN 
+  (SELECT add_to_cart_order, orders_product_train.orders_id
+  FROM orders_product_train 
+  WHERE add_to_cart_order > 4
+  UNION ALL
+  SELECT add_to_cart_order, orders_product_prior.orders_id
+  FROM orders_product_prior
+    WHERE add_to_cart_order > 4
+  ) AS op2
+  ON op2.orders_id = op.orders_id
+  WHERE op2.orders_id IS NULL
+GROUP BY a.aisle
+ORDER BY aisle_total_number DESC")
+  saveRDS(quick_visit_aisles_4, "quick_visit_aisles_4.rds")
+}else{
+  quick_visit_aisles_4 <- readRDS("quick_visit_aisles_4.rds")
+}
+```
+
+
+```{r}
+quick_visit_aisles_4$aisle <- factor(quick_visit_aisles_4$aisle, levels = unique(quick_visit_aisles_4$aisle)[order(quick_visit_aisles_4$aisle_total_number, decreasing = TRUE)])
+
+p <- plot_ly(y = quick_visit_aisles_4$aisle_total_number, x = quick_visit_aisles_4$aisle, type = "bar") %>%
+  layout(title='Häufige Aisles in kleinen Warenkörben')
+```
+
+```{r echo=FALSE}
+p
+```
+## Warenkörb-Grösse nach Zeit und Tag
+Man sieht auch sehr gut, dass in der Mittagszeit die Anzahl Produkte pro Warenkorb abnimmt. Das sind kleine Warenkorbe mit einem Mittagessen (e.g. Frucht, yogurt und ein Sandwich) drin. Der "Mittagessen"-Rush könnte gut von Self-Checkout Maschinen abgefangen werden. 
+```{r}
+all_useful_data_joined_w_pb_db <- all_useful_data_joined_db %>% dplyr::mutate(products_bought = 1)
+all_useful_data_joined_w_pb_selected_db <- all_useful_data_joined_w_pb_db %>% select(c(orders_id, order_hour_of_day, order_dow,products_bought))
+grouped_by_order_id_temp <- group_by(all_useful_data_joined_w_pb_selected_db, orders_id)
+grouped_by_order_id <- dplyr::summarise(grouped_by_order_id_temp,
+                          products_bought = sum(products_bought),
+                          order_dow = MAX(order_dow),
+                          Uhrzeit = MAX(order_hour_of_day)
+                          )
+color_list = list(color='white')
+grouped_by_order_id_wochentag_name <- left_join(collect(grouped_by_order_id), wochentag_nummer)
+grouped_by_order_id_wochentag_name$Wochentag <- add_factor(grouped_by_order_id_wochentag_name)
+```
+
+
+
+```{r}
+p <- plot_ly(z = grouped_by_order_id_wochentag_name$products_bought, x = grouped_by_order_id_wochentag_name$Wochentag, y = grouped_by_order_id_wochentag_name$Uhrzeit, type = "heatmap") %>%
+  layout(title = list(text = 'Produkte gekauft pro Bestellung'))
+p
+```
+# Analyse Öffnungszeiten
+
+```{r}
+# Here we create the table with the information about products sold per hour per day. Also we replace the day-number with it's name.
+all_useful_data_joined_w_pb_db <- all_useful_data_joined_db %>%
+  dplyr::mutate(products_bought = 1)
+all_useful_data_joined_w_pb_selected_db <- all_useful_data_joined_w_pb_db %>% select(c(order_hour_of_day, order_dow ,products_bought))
+grouped_by_hour_day_temp <- group_by(all_useful_data_joined_w_pb_selected_db, order_hour_of_day, order_dow)
+grouped_by_hour_day_summed_db <- dplyr::summarise(grouped_by_hour_day_temp,
+                          products_bought = sum(products_bought)
+                          )
+grouped_by_hour_day_summed_db_with_day_name <- left_join(collect(grouped_by_hour_day_summed_db), wochentag_nummer)
+grouped_by_hour_day_summed_db_with_day_name$Wochentag <- add_factor(grouped_by_hour_day_summed_db_with_day_name)
+```
+
+## Verkaufte Produkte pro Stunde und Tag
+In diesem Plot ist die y-Achse die Uhrzeit und die Farben die Verkauften Produkte pro Stunde pro Tag. Schaut man sich die gekauften Produkte pro Stunde über alle Wochentage an, ist erkennbar, dass am Wochenende am meisten Produkte gekauft werden. Man kann auch für jede einzelne Stunde nachschauen, wie viele Produkte verkauft werden. 
+
+Beispielsweise: Am Samstag von 14-15 Uhr wurden 595'896 Produkte verkauft.
+
+```{r}
+verkaufte_produkte_pro_stunde_pro_tag <- plot_ly(z = grouped_by_hour_day_summed_db_with_day_name$products_bought, y = grouped_by_hour_day_summed_db_with_day_name$order_hour_of_day, x = grouped_by_hour_day_summed_db_with_day_name$Wochentag, type = 'heatmap') %>%
+  layout(title='Produkte gekauft pro Stunde und Tag')
+verkaufte_produkte_pro_stunde_pro_tag
+```
+
+
+```{r}
+orders_db <-tbl(con, "orders")
+orders_db_sum <- orders_db %>% 
+  select(orders_id,order_hour_of_day,order_dow) %>%
+  distinct() %>%
+  dplyr::mutate(orders = 1)
+
+grouped_by_order_id_dow_hour_order_summed_temp <- orders_db_sum %>% 
+  group_by(order_dow, order_hour_of_day)
+ 
+grouped_by_order_id_dow_hour_order_summed <- dplyr::summarise(grouped_by_order_id_dow_hour_order_summed_temp,
+                          orders = sum(orders)
+			  )
+grouped_by_order_id_dow_hour_order_summed_wochentag_name <- left_join(collect(grouped_by_order_id_dow_hour_order_summed), wochentag_nummer)
+grouped_by_order_id_dow_hour_order_summed_wochentag_name$Wochentag <- add_factor(grouped_by_order_id_dow_hour_order_summed_wochentag_name)
+```
+## Verkaufte Warenkörbe pro Stunde
+Hier schauen wir uns die Bestellungen pro Stunde an. Man kann erkennen, dass am Wochenende die meisten Einkäufe getätigt werden. Auch wird Samstags noch später eingekauft als an den anderen Tagen. Samstags finden die meisten Einkäufe zwischen 10 und 16 Uhr statt, Sonntags 9 und 11 Uhr. Am Wochenende muss man also mit mehr Ansturm rechnen.
+
+Beispiel: Am Samstag von 14-15 Uhr haben wir 54'552 Bestellungen erhalten.
+```{r Plot Bestellungen pro Stunde}
+p = plot_ly(z = grouped_by_order_id_dow_hour_order_summed_wochentag_name$orders, y = grouped_by_order_id_dow_hour_order_summed_wochentag_name$order_hour_of_day, x = grouped_by_order_id_dow_hour_order_summed_wochentag_name$Wochentag, type = 'heatmap') %>%
+  layout(title='Warenkörbe pro Stunde und Tag')
+```
+
+```{r echo=FALSE}
+p
+```
+
+```{r} 
+# This Table cointains Products bought per day
+grouped_by_weekday_temp <- group_by(grouped_by_hour_day_summed_db, order_dow)
+grouped_by_weekday <- dplyr::summarise(grouped_by_weekday_temp,
+                          products_bought = sum(products_bought)
+                          )
+grouped_by_weekday_with_day_name <- left_join(collect(grouped_by_weekday), wochentag_nummer)
+grouped_by_weekday_with_day_name$Wochentag <- add_factor(grouped_by_weekday_with_day_name)
+```
+## Verkaufte Produkte pro Tag
+Im Säulendiagramm sieht man die bereits erkannten Muster. Das Wochenende hat die umsatzstärksten Tage, Dienstag und Mittwoch sind die beiden schwächsten Tage. Im Durchschnitt wird an einem Samstag ca. 1.66x soviele Produkte verkauft wie an einem Mittwoch.
+```{r}
+p <- plot_ly(type = "bar", y = grouped_by_weekday_with_day_name$products_bought, 
+             x = grouped_by_weekday_with_day_name$Wochentag, 
+             text = grouped_by_weekday_with_day_name$products_bought, textposition = 'auto',
+    ) %>%
+  layout(title='Produkte gekauft pro Tag')
+p
+```
+
+## Häufigkeit der Tage im Datenset
+Man sieht, dass der Samstag häufiger vorkommt im Datenset, unabhängig von den gekauften Produkten. Dies ist aber auch zu erwarten, es bedeutet also nicht, dass am Samstag zuverlässiger Daten erfasst wurden. Am Wochenende wird einfach mehr eingekauft. Der Samstag kommt also dementsprechend 1.41x soviel mal vor wie der Mittwoch. 
+```{r}
+orders_day_grouped_summed <- orders_db %>%
+  select(orders_id, order_dow) %>%
+  group_by(order_dow) %>%
+  dplyr::summarise(nr_of_appear = n())
+
+orders_day_grouped_summed_with_day_name <- left_join(collect(orders_day_grouped_summed), wochentag_nummer)
+orders_day_grouped_summed_with_day_name$Wochentag <- add_factor(orders_day_grouped_summed_with_day_name)
+```
+
+```{r}
+p <- plot_ly(type = "bar", y = orders_day_grouped_summed_with_day_name$nr_of_appear, x = orders_day_grouped_summed_with_day_name$Wochentag,
+             text = orders_day_grouped_summed_with_day_name$nr_of_appear, textposition = 'auto'
+             ) %>%
+  layout(title='Verteilung der Tage im Datenset')
+p
+```
+## Verhältniss der gekauften Produkte pro Tag und Verteilung der Tage im Datenset (Durchschnitte Warenkorbgrösse pro Tag)
+Wir sehen, dass bei der Division von den verkauften Produkten pro Tag durch die Häufigkeit der Tage, das Wochenende ebenfalls auffällt. Am Wochenende wird viel eingekauft, gleichzeitig sind aber auch Warenkörbe am grössten. 
+```{r}
+ratio_appearances_day_products_sold_day  <- orders_day_grouped_summed_with_day_name %>% 
+  left_join(collect(grouped_by_weekday)) %>%
+  dplyr::mutate(Relation = round(products_bought/nr_of_appear,3))
+p <- plot_ly(type = "bar", y = ratio_appearances_day_products_sold_day$Relation, x = ratio_appearances_day_products_sold_day$Wochentag,
+             text = ratio_appearances_day_products_sold_day$Relation, textposition = 'auto'
+             ) %>%
+  layout(title='Durchschnitte Warenkorbgrösse pro Tag')
+p
+```
+
+## Verkaufte Produkte pro Stunde
+```{r} 
+grouped_by_hour_temp <- group_by(grouped_by_hour_day_summed_db, order_hour_of_day)
+grouped_by_hour <- dplyr::summarise(grouped_by_hour_temp,
+                          products_bought = sum(products_bought)
+                          )
+grouped_by_hour_local = collect(grouped_by_hour)
+grouped_by_hour_local
+```
+Betrachtet man die gekauften Produkte und zu welcher Uhrzeit sie gekauft wurden, kann man erkennen dass zu den üblichen Öffnungszeiten am meisten Produkte verkauft werden. Der absolute Peak ist aber von 10 Uhr bis 15 Uhr.
+```{r}
+p <- plot_ly( y = grouped_by_hour_local$products_bought, x = grouped_by_hour_local$order_hour_of_day, type = 'bar') %>%
+  layout(title='Verkaufte Produkte pro Stunde')
+p
+```
+
+
+## Gekaufte Produkte pro Stunde - einzelne Tage im Vergleich
+Hier kann man direkt die einzelnen Tage miteinander vergleichen. Interessant ist der Knick am Sonntag. Wahrscheinlich tätigen da viele Leute ihren Morgeneinkauf. Insgesammt ist das Muster aber über alle Tage das gleiche: Zwischen 10 und 16 Uhr wird am meisten eingekauft und nachts so gut wie gar nicht.
+```{r} 
+grouped_by_hour_day_temp <- group_by(grouped_by_hour_day_summed_db, order_hour_of_day, order_dow)
+grouped_by_hour_day <- dplyr::summarise(grouped_by_hour_day_temp,
+                          products_bought = sum(products_bought)
+                          )
+grouped_by_hour_day_local = collect(grouped_by_hour_day)
+```
+
+```{r}
+create_line_plotproducts_bought_per_hour <- function(x){
+    add_trace(y = ~products_bought[grouped_by_hour_day_local$Wochentag == x], name = x, mode = 'lines',type = 'scatter')
+}
+```
+```{r}
+grouped_by_hour_day_local = left_join(grouped_by_hour_day_local, wochentag_nummer)
+
+line_plots <- plot_ly(grouped_by_hour_day_local, x= ~order_hour_of_day[grouped_by_hour_day_local$Wochentag == 'Samstag'], 
+                      y = ~products_bought[grouped_by_hour_day_local$Wochentag == 'Samstag'],
+                      type = 'scatter', mode = 'lines', name = 'Samstag') %>%
+  add_trace(y = ~products_bought[grouped_by_hour_day_local$Wochentag == 'Sonntag'], name = 'Sonntag', mode = 'lines',type = 'scatter') %>% 
+    add_trace(y = ~products_bought[grouped_by_hour_day_local$Wochentag == 'Montag'], name = 'Montag', mode = 'lines',type = 'scatter') %>%
+    add_trace(y = ~products_bought[grouped_by_hour_day_local$Wochentag == 'Dienstag'], name = 'Dienstag', mode = 'lines',type = 'scatter') %>%
+    add_trace(y = ~products_bought[grouped_by_hour_day_local$Wochentag == 'Mittwoch'], name = 'Mittwoch', mode = 'lines',type = 'scatter') %>%
+    add_trace(y = ~products_bought[grouped_by_hour_day_local$Wochentag == 'Donnerstag'], name = 'Donnerstag', mode = 'lines',type = 'scatter') %>%
+    add_trace(y = ~products_bought[grouped_by_hour_day_local$Wochentag == 'Freitag'], name = 'Freitag', mode = 'lines',type = 'scatter') %>% 
+  layout(xaxis = list(title = 'Uhrzeit'), yaxis = list(title = 'Verkaufte Produkte')) %>%
+  layout(title = list(text = 'Produkte gekauft pro Stunde pro Tag'))
+line_plots
+```
+
+
+```{r}
+# Diese Funktion die %-Zahl aller verkauften Produkte zwischen zwei definierten Stunden. Es unterscheidet nicht zwischen den Tagen.
+grouped_by_hour_temp <- group_by(grouped_by_hour_day_summed_db, order_hour_of_day) 
+grouped_by_hour <- dplyr::summarise(grouped_by_hour_temp,
+                          products_bought = sum(products_bought)
+                          
+			  )
+sum_total <- grouped_by_hour %>%
+  group_by() %>%
+  dplyr::summarise(sum = sum(products_bought))
+
+sum_collected <- collect(sum_total)
+products_bought_between_x_and_y <- function(x,y) {
+  if (x > y) {
+    tmp <- y
+    y <- x
+    x <- tmp
+    }
+
+  sum_filtered <- grouped_by_hour %>%
+    filter(order_hour_of_day >= x) %>%
+    filter(order_hour_of_day <= y) %>%
+    group_by() %>%
+    dplyr::summarise(sum = sum(products_bought))
+
+  return(as.numeric(collect(sum_filtered))/as.numeric(sum_collected))
+}
+```
+
+
+```{r}
+destfile="matrix_oeffnungszeiten.rds" 
+  if(!file.exists(destfile)){
+    # Hier genieren wir eine Matrix um diese später mit der obengennanten Funktion zu füllen.
+    matrix_oeffnungszeiten <- matrix(data=0, nrow = 24, ncol = 24)
+    rownames(matrix_oeffnungszeiten) <- 0:23
+    colnames(matrix_oeffnungszeiten) <- 0:23
+  
+    total_loops = 23*23/2
+
+    pb <- progress_bar$new(total = total_loops, format = "Creating matrix pepop. [:bar] :percent eta: :eta")
+
+    pb$tick(0)
+    for (i in 1:24){
+      j = i + 1
+      while (j <= 24){
+        matrix_oeffnungszeiten[i,j] = products_bought_between_x_and_y(i-1,j-1)
+        j = j + 1
+        pb$tick
+      }
+    }
+    saveRDS(matrix_oeffnungszeiten, "matrix_oeffnungszeiten.rds")
+  }else{
+    matrix_oeffnungszeiten = readRDS("matrix_oeffnungszeiten.rds")
+  }
+```
+
+## Verkaufte Produkte pro Zeit pro Tag (Relativ)
+```{r}
+# Diese Funktion gibt die relativ gekauften Produkte zwischen zwei Stunden relativ zu allen gekauften Produkte an diesem Tag zurück. x = 'Uhrzeit ab', y = 'Uhrzeit bis' und k = 'Tag.
+products_bought_between_x_and_y_day <- function(x,y,k) {
+  if (x > y) {
+    tmp <- y
+    y <- x
+    x <- tmp
+  }
+  sum_collected_total <- grouped_by_hour_day_summed_db_with_day_name %>%
+    filter(Wochentag == k) %>%
+    group_by() %>%
+    dplyr::summarise(sum = sum(products_bought))
+
+  sum_hourly <- grouped_by_hour_day_summed_db_with_day_name %>%
+    filter(Wochentag == k) %>%
+    filter(order_hour_of_day >= x) %>%
+    filter(order_hour_of_day <= y) %>%
+    distinct() %>%
+    group_by() %>%
+    dplyr::summarise(sum = sum(products_bought))
+
+  return(as.numeric(collect(sum_hourly))/as.numeric(collect(sum_collected_total)))
+}
+```
+
+```{r}
+# Meiste Produkte werden am Samstag gekauft (Siehe Histogram weiter oben). Diese Funktion gibt die realtiv verkauften Produkte verkauft pro Stunde. Der Referenztag kann angepasst werden, aber hier wird momentan der Samstag benutzt, da an diesem am meisten Produte verkauft werden.
+produkte_gekauft_max <- 6533692
+products_bought_between_x_and_y_day_compared_to_max <- function(x,y,k) {
+  if (x > y) {
+    tmp <- y
+    y <- x
+    x <- tmp
+  }
+  sum_hourly <- grouped_by_hour_day_summed_db_with_day_name %>%
+    filter(Wochentag == k) %>%
+    filter(order_hour_of_day >= x) %>%
+    filter(order_hour_of_day <= y) %>%
+    distinct() %>%
+    group_by() %>%
+    dplyr::summarise(sum = sum(products_bought))
+  
+  return(as.numeric(collect(sum_hourly))/produkte_gekauft_max)
+}
+```
+
+```{r}
+# Meiste Produkte in einer Stunde werden am Samstag Nachmittag gekauft (Siehe Histogram weiter oben) und somit nutzen wir das auch als Referenz.
+produkte_gekauft_max_stunde <- 595896
+products_bought_between_x_and_y_day_compared_to_max_hourly <- function(x,y,k) {
+  if (x > y) {
+    tmp <- y
+    y <- x
+    x <- tmp
+  }
+  sum_hourly <- grouped_by_hour_day_summed_db_with_day_name %>%
+    filter(Wochentag == k) %>%
+    filter(order_hour_of_day >= x) %>%
+    filter(order_hour_of_day <= y) %>%
+    distinct() %>%
+    group_by() %>%
+    dplyr::summarise(sum = sum(products_bought))
+  
+  return(as.numeric(collect(sum_hourly))/produkte_gekauft_max_stunde)
+}
+```
+
+
+## Interaktiver Plot mit den verkauften Produkte pro Stunde relativ zu zwei Referenzen und stündliche erwartete Belastung
+Jede der sieben Matrizen zeigt einen Wochentag an und jede einzelne Matrize enthält drei verschiedene Informationen;
+Oben links der Matrix werden die relativ zum Samstag stündlich verkauften Produkte dargestellt. Lesebeispiel: Am Montag zwischen 4 und 17 Uhr wurden 60.0% der am Samstag verkauften Produkte verkauft.
+
+![Relativ-verkaufte Produkte im Zeitfenster](images/m_monday_top_left.png)
+
+In der Diagonalen kann die erwartete Belastung, verglichen mit der Stunde am Samstag zwischen 14-15 Uhr, abgelesen werden. Lesebeispiel: Am Montag von 9-10 Uhr erwarten wir, dass 57.0% der Produkte wie am Samstag von 14-15 Uhr verkauft werden.
+![Erwartete Belastung pro Stunde](images/m_monday_diag.png)
+
+Unten Rechts in der Matrix sehen wir das gleiche wie Oben Links, nur das der Referenz der gleiche Tag ist und nicht der Samstag. Lesebeispiel: Zwischen 5-21 Uhr am Montag 95.3% der Produkte vom gesamten Tag verkauft.
+![Verkaufte Produkte im Zeitfenster](images/m_monday_bottom_right.png)
+
+Aus diesen Angaben lassen sich Arbeitspläne und Einsätze generieren, da man ablesen kann, was man für eine Belastung in einer bestimmten Stunde erwarten kann. Ebenfalls lassen sich damit schnelle und fundierte Entscheidungen treffen bei Ausfälle oder Einsätze. 
+
+```{r}
+create_matrix <- function(){
+      matrix_oeffnungszeiten <- matrix(data=0, nrow = 24, ncol = 24)
+      rownames(matrix_oeffnungszeiten) <- 0:23
+      colnames(matrix_oeffnungszeiten) <- 0:23
+      matrix_oeffnungszeiten
+}
+```
+
+```{r}
+destfile="matrix_oeffnungszeiten_0.rds" 
+  if(!file.exists(destfile)){
+    matrix_oeffnungszeiten_0 <- create_matrix()
+    matrix_oeffnungszeiten_1 <- create_matrix()
+    matrix_oeffnungszeiten_2 <- create_matrix()
+    matrix_oeffnungszeiten_3 <- create_matrix()
+    matrix_oeffnungszeiten_4 <- create_matrix()
+    matrix_oeffnungszeiten_5 <- create_matrix()
+    matrix_oeffnungszeiten_6 <- create_matrix()
+    total_loops = 23*23/2
+
+    pb <- progress_bar$new(total = total_loops, format = "Creating matrix pepop. [:bar] :percent eta: :eta")
+    pb$tick(0)
+    
+    i = 1
+    while (i <= 24){
+      j = i + 1
+      matrix_oeffnungszeiten_0[i,i]= products_bought_between_x_and_y_day_compared_to_max_hourly(i-1,i-1,'Samstag')
+      matrix_oeffnungszeiten_1[i,i]= products_bought_between_x_and_y_day_compared_to_max_hourly(i-1,i-1,'Sonntag')
+      matrix_oeffnungszeiten_2[i,i]= products_bought_between_x_and_y_day_compared_to_max_hourly(i-1,i-1,'Montag')
+      matrix_oeffnungszeiten_3[i,i]= products_bought_between_x_and_y_day_compared_to_max_hourly(i-1,i-1,'Dienstag')
+      matrix_oeffnungszeiten_4[i,i]= products_bought_between_x_and_y_day_compared_to_max_hourly(i-1,i-1,'Mittwoch')
+      matrix_oeffnungszeiten_5[i,i]= products_bought_between_x_and_y_day_compared_to_max_hourly(i-1,i-1,'Donnerstag')
+      matrix_oeffnungszeiten_6[i,i]= products_bought_between_x_and_y_day_compared_to_max_hourly(i-1,i-1,'Freitag')
+      while (j <= 24){
+        matrix_oeffnungszeiten_0[i,j]= products_bought_between_x_and_y_day(i-1,j-1,'Samstag')
+        matrix_oeffnungszeiten_1[i,j]= products_bought_between_x_and_y_day(i-1,j-1,'Sonntag')
+        matrix_oeffnungszeiten_2[i,j]= products_bought_between_x_and_y_day(i-1,j-1,'Montag')
+        matrix_oeffnungszeiten_3[i,j]= products_bought_between_x_and_y_day(i-1,j-1,'Dienstag')
+        matrix_oeffnungszeiten_4[i,j]= products_bought_between_x_and_y_day(i-1,j-1,'Mittwoch')
+        matrix_oeffnungszeiten_5[i,j]= products_bought_between_x_and_y_day(i-1,j-1,'Donnerstag')
+        matrix_oeffnungszeiten_6[i,j]= products_bought_between_x_and_y_day(i-1,j-1,'Freitag')
+        
+        matrix_oeffnungszeiten_0[25-i,25-j]= 0
+        matrix_oeffnungszeiten_1[25-i,25-j]= products_bought_between_x_and_y_day_compared_to_max(j-1,i-1,'Sonntag')
+        matrix_oeffnungszeiten_2[25-i,25-j]= products_bought_between_x_and_y_day_compared_to_max(j-1,i-1,'Montag')
+        matrix_oeffnungszeiten_3[25-i,25-j]= products_bought_between_x_and_y_day_compared_to_max(j-1,i-1,'Dienstag')
+        matrix_oeffnungszeiten_4[25-i,25-j]= products_bought_between_x_and_y_day_compared_to_max(j-1,i-1,'Mittwoch')
+        matrix_oeffnungszeiten_5[25-i,25-j]= products_bought_between_x_and_y_day_compared_to_max(j-1,i-1,'Donnerstag')
+        matrix_oeffnungszeiten_6[25-i,25-j]= products_bought_between_x_and_y_day_compared_to_max(j-1,i-1,'Freitag')
+        j = j + 1
+        pb$tick
+      }
+      i = i + 1
+    }
+    saveRDS(matrix_oeffnungszeiten_0, "matrix_oeffnungszeiten_0.rds")
+    saveRDS(matrix_oeffnungszeiten_1, "matrix_oeffnungszeiten_1.rds")
+    saveRDS(matrix_oeffnungszeiten_2, "matrix_oeffnungszeiten_2.rds")
+    saveRDS(matrix_oeffnungszeiten_3, "matrix_oeffnungszeiten_3.rds")
+    saveRDS(matrix_oeffnungszeiten_4, "matrix_oeffnungszeiten_4.rds")
+    saveRDS(matrix_oeffnungszeiten_5, "matrix_oeffnungszeiten_5.rds")
+    saveRDS(matrix_oeffnungszeiten_6, "matrix_oeffnungszeiten_6.rds")
+  }else{
+    matrix_oeffnungszeiten_0 = readRDS("matrix_oeffnungszeiten_0.rds")
+    matrix_oeffnungszeiten_1 = readRDS("matrix_oeffnungszeiten_1.rds")
+    matrix_oeffnungszeiten_2 = readRDS("matrix_oeffnungszeiten_2.rds")
+    matrix_oeffnungszeiten_3 = readRDS("matrix_oeffnungszeiten_3.rds")
+    matrix_oeffnungszeiten_4 = readRDS("matrix_oeffnungszeiten_4.rds")
+    matrix_oeffnungszeiten_5 = readRDS("matrix_oeffnungszeiten_5.rds")
+    matrix_oeffnungszeiten_6 = readRDS("matrix_oeffnungszeiten_6.rds")
+}
+    
+```
+
+
+```{r}
+create_plot_verkaufte_produkte_pro_stunde <- function(matrix, tag)
+  plot_ly(x = colnames(matrix), y = colnames(matrix), z = matrix, type = "heatmap",
+        colorscale='Viridis', name = tag
+        )
+```
+
+```{r}
+color_list = list(color = 'white')
+p <- subplot(nrows = 3,
+              create_plot_verkaufte_produkte_pro_stunde(matrix_oeffnungszeiten_2, 'Montag'),
+              create_plot_verkaufte_produkte_pro_stunde(matrix_oeffnungszeiten_3, 'Dienstag'),
+              create_plot_verkaufte_produkte_pro_stunde(matrix_oeffnungszeiten_4, 'Mittwoch'),
+              create_plot_verkaufte_produkte_pro_stunde(matrix_oeffnungszeiten_5, 'Donnerstag'),
+              create_plot_verkaufte_produkte_pro_stunde(matrix_oeffnungszeiten_6, 'Freitag'),
+              create_plot_verkaufte_produkte_pro_stunde(matrix_oeffnungszeiten_0, 'Samstag'),
+              create_plot_verkaufte_produkte_pro_stunde(matrix_oeffnungszeiten_1, 'Sonntag')
+) %>% 
+  layout(title = 'Verkaufte Produkte und Belastung pro Stunde', height = 900, width = 1200) %>%
+  layout(title = list(text = 'Produkte gekauft pro Bestellung pro Stunde pro Tag'))
+
+```
+
+```{r, echo=FALSE}
+p
+```
+## Warenkorbgrössen
+Im folgenden Plot sieht man die Grösse und Anzahl der Warbenkörbe mit dieser Grösse.  Inter
+```{r}
+basket_sizes <- all_useful_data_joined_db %>%
+  group_by(orders_id) %>%
+  summarize(basket_size = MAX(add_to_cart_order)) %>%
+  dplyr::mutate(number_basket_size = 1) %>%
+  group_by(basket_size) %>%
+  summarize(number_basket_size = SUM(number_basket_size))
+
+basket_size_local = collect(basket_sizes)
+fig <- plot_ly(x = basket_size_local$basket_size, y = basket_size_local$number_basket_size,
+  type = "bar"
+) %>%
+  layout(title = "Warenkorbgrössen", 
+         xaxis = list(title = "Anzahl Produkte"),
+         yaxis = list(title = "Anzahl Warenkörbe"))
+
+fig
+```
+## Kundenzufriedenheit
+Kommen die Kunden gerne zurück? In nachfolgenden Plot schauen wir uns an, ob es eine Kundenbindung gibt und somit ob die Kunden gerne diesen Service benutzen.
+```{r}
+number_order_numbers <- all_useful_data_joined_db %>%
+  group_by(user_id) %>%
+  summarize(order_number = MAX(order_number)) %>%
+  dplyr::mutate(number_order_number = 1) %>%
+  group_by(order_number) %>%
+  summarize(number_order_number = SUM(number_order_number))
+
+number_order_numbers_local = collect(number_order_numbers)
+fig <- plot_ly(x = number_order_numbers_local$order_number, y = number_order_numbers_local$number_order_number,
+  type = "bar"
+) %>%
+  layout(title = "Anzahl Einkäufe der Kunde", 
+         yaxis = list(title = "Anzahl Kunden"),
+         xaxis = list(title = "Anzahl Einkäufe"))
+
+fig
+# Statements! Codieren, analysieren, beschreiben und interpretieren. 99, 100 artefakt? Beschreiben.
+```
+Die Kunden mögen Ihre Läden! Interessanterweise gibt es keinen einzigen Kunden, welcher nur einmal bei Ihnen einkaufen war. Dies liegt aber wohl eher daran, dass Warenkörbe mit nur einem oder zwei Produkten nicht in den Daten aufgenommen werden oder Instacart eine Mindestbestellanzahl hat. 
+Ebenfalls ausfallend ist der Cluster bei 99 und 100; Dies ist wohl ein Artefakt, welches sich zusammensetzt aus allen Warenkörben mit mehr als 99, respektive 100 Produkten. Warum es zwei Cluster hat, ist uns nicht bekannt. 
+
+## Wann kaufen Super-Stammkunden ein? Gibt es Unterschiede?
+Momentan zählt jeder Kunde mit mehr als 50 Bestellungen als Super-Stammkunde.
+
+```{r}
+stammkunde_ab <- 50
+product_bought_per_hour_stammkunden <- all_useful_data_joined_w_pb_db %>% 
+  filter(order_number > stammkunde_ab) %>%
+  select(products_bought, order_dow, order_hour_of_day) %>%
+  group_by(order_dow, order_hour_of_day) %>%
+  dplyr::summarise(
+    products_bought_sum = sum(products_bought)
+  )
+product_bought_per_hour_stammkunden_local = collect(product_bought_per_hour_stammkunden)
+```
+
+```{r}
+products_bought_sum_local_Wochentag = left_join(product_bought_per_hour_stammkunden_local, wochentag_nummer)
+products_bought_sum_local_Wochentag$Wochentag <- add_factor(products_bought_sum_local_Wochentag)
+
+p <- plot_ly(z = products_bought_sum_local_Wochentag$products_bought_sum, y = products_bought_sum_local_Wochentag$order_hour_of_day, x = products_bought_sum_local_Wochentag$Wochentag, type = 'heatmap') %>%
+  layout(title='Bestellungen pro Stunde pro Tag von Super-Stammkunden')
+```
+
+```{r, echo=FALSE}
+p
+```
+Interessant ist der Sonntag morgen, wo Stammkunden sehr häufig einkaufen gehen.
+## Empfehlungen für Öffnungszeiten
+Wir geben Ihnen Anhand der vorliegenden Daten vier Empfehlungen: 
+
+### 1. Einfach und effizient
+Von 8 Uhr Morgens bis 8 Uhr Abends. Dies deckt im Schnitt 88.3% der verkaufte Produkte unter der Woche ab und zu 89.85% der verkauften Produkte am Wochenende. Diese Öffnungszeiten sind leicht zu merken und sozial. Trotzdem werden die Geschäfte geschlossen, sobald zuwenig Eingekauft wird.
+
+### 2. 22 Stunden pro Tag und 7 Tage offen für maximale Expansion
+99.8% der verkauften Produkte abdecken? Vielleicht lässt sich so auch ein kleiner Tante-Emma Laden aus dem Markt drängen und noch mehr Profit herausholen.
+
+### 3. Mehr Zeit zum Shoppen; Maximaler Verkauf
+Öffnungszeiten von 7 bis 23 Uhr erlauben Ihnen unter der Woche und am Wochenende 97.4% der bestellten Produkte abzudecken. 
+
+### 4. Nur die wirklich wichtigen Stunden
+Von 9 Uhr Morgens bis 15 Uhr Abends decken Sie immerhin noch 56.4% der Produkte ab unter der Woche und 58.2% am Wochenende. 
+
+
+## Kurzes Schlusswort
+Jede Empfehlung hat stärken und schwächen und in jeder Empfehlung kommen Super-Stammkunden zufrieden raus.
+
+
+# Weiteres Vorgehen
+Zur Planung der Belastung könnte man auch nicht nur verkauften Produkte anschauen, sondern auch die Warenkorbgrösse. Am Donnerstag zB. kommt ein Grosseinkauf, darauf könnte man sich speziell vorbereiten. Über Mittag sieht man auch, dass die Warenkörbe kleiner werden und die generiete Belastung von diesen könnten Self-Checkout Kassen übernehmen.
+```{r}
+all_useful_data_joined_w_pb_db <- all_useful_data_joined_db %>% dplyr::mutate(products_bought = 1)
+all_useful_data_joined_w_pb_selected_db <- all_useful_data_joined_w_pb_db %>% select(c(orders_id, order_hour_of_day, order_dow,products_bought))
+grouped_by_order_id_temp <- group_by(all_useful_data_joined_w_pb_selected_db, orders_id)
+grouped_by_order_id <- dplyr::summarise(grouped_by_order_id_temp,
+                          products_bought = sum(products_bought),
+                          order_dow = MAX(order_dow),
+                          Uhrzeit = MAX(order_hour_of_day)
+                          )
+color_list = list(color='white')
+grouped_by_order_id_wochentag_name <- left_join(collect(grouped_by_order_id), wochentag_nummer)
+grouped_by_order_id_wochentag_name$Wochentag <- add_factor(grouped_by_order_id_wochentag_name)
+```
+
+```{r}
+p <- plot_ly(z = grouped_by_order_id_wochentag_name$products_bought, x = grouped_by_order_id_wochentag_name$Wochentag, y = grouped_by_order_id_wochentag_name$Uhrzeit, type = "heatmap") %>%
+  layout(title = list(text = 'Produkte gekauft pro Bestellung'))
+p
+```
+
